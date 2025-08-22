@@ -95,10 +95,16 @@ from vllm_ascend.torchair.torchair_attention import AscendTorchairMetadata
 from vllm_ascend.torchair.torchair_mla import AscendMLATorchairMetadata
 from vllm_ascend.utils import (ACL_FORMAT_FRACTAL_ND, ACL_FORMAT_FRACTAL_NZ,
                                ProfileExecuteDuration, is_310p,
-                               maybe_converting_weight_acl_format)
+                               maybe_converting_weight_acl_format,
+                               vllm_version_is)
 from vllm_ascend.worker.eagle_proposer_v1 import EagleProposer
 from vllm_ascend.worker.mtp_proposer_v1 import MtpProposer
 from vllm_ascend.worker.npu_input_batch import CachedRequestState, InputBatch
+
+if not vllm_version_is("0.10.1.1"):
+    from vllm.v1.outputs import DraftTokenIds
+else:
+    DraftTokenIds = None
 
 if TYPE_CHECKING:
     import xgrammar as xgr  # type: ignore[import-untyped]
@@ -255,14 +261,14 @@ class NPUModelRunner(LoRAModelRunnerMixin):
             if get_pp_group().is_last_rank:
                 if self.speculative_config.method == "ngram":
                     self.drafter = NgramProposer(self.vllm_config)
-                elif self.speculative_config.use_eagle():
+                elif self.speculative_config.method in ["eagle", "eagle3"]:
                     self.use_eagle = True
                     self.drafter = EagleProposer(self.vllm_config, self.device,
                                                  self)  # type: ignore
                     if self.speculative_config.method == "eagle3":
                         self.use_aux_hidden_state_outputs = True
-                # elif self.speculative_config.method == 'deepseek_mtp':
-                #     self.drafter = MtpProposer(self.vllm_config, self)
+                elif self.speculative_config.method == 'deepseek_mtp':
+                    self.drafter = MtpProposer(self.vllm_config, self)
                 else:
                     raise ValueError("Unknown speculative decoding method: "
                                      f"{self.speculative_config.method}")
@@ -515,9 +521,9 @@ class NPUModelRunner(LoRAModelRunnerMixin):
             # Update the block IDs.
             if not resumed_from_preemption:
                 if new_block_ids is not None:
-                # Append the new blocks to the existing block IDs.
+                    # Append the new blocks to the existing block IDs.
                     for block_ids, new_ids in zip(req_state.block_ids,
-                                              new_block_ids):
+                                                  new_block_ids):
                         block_ids.extend(new_ids)
             else:
                 assert new_block_ids is not None
@@ -1484,7 +1490,7 @@ class NPUModelRunner(LoRAModelRunnerMixin):
                 valid_sampled_token_ids)
         elif self.speculative_config.method == "eagle":
             raise NotImplementedError("Eagle Is Not Supported Yet.")
-        elif self.speculative_config.use_eagle():
+        elif self.speculative_config.method == "eagle3":
             draft_token_ids = self._generate_eagle3_token_ids(
                 valid_sampled_token_ids, sampling_metadata, scheduler_output,
                 spec_decode_metadata, positions, num_scheduled_tokens,
@@ -1530,16 +1536,28 @@ class NPUModelRunner(LoRAModelRunnerMixin):
             else:
                 pooler_output.append(None)
         extra_args = ({"kv_connector_output": kv_connector_output})
-
-        return ModelRunnerOutput(
-            req_ids=self.input_batch.req_ids,
-            req_id_to_index=self.input_batch.req_id_to_index,
-            sampled_token_ids=[],
-            logprobs=None,
-            prompt_logprobs_dict={},
-            pooler_output=pooler_output,
-            **extra_args,
-        )
+        if vllm_version_is("0.10.1.1"):
+            modelrunner_output = ModelRunnerOutput(
+                req_ids=self.input_batch.req_ids,
+                req_id_to_index=self.input_batch.req_id_to_index,
+                sampled_token_ids=[],
+                spec_token_ids=None,
+                logprobs=None,
+                prompt_logprobs_dict={},
+                pooler_output=pooler_output,
+                **extra_args,
+            )
+        else:
+            modelrunner_output = ModelRunnerOutput(
+                req_ids=self.input_batch.req_ids,
+                req_id_to_index=self.input_batch.req_id_to_index,
+                sampled_token_ids=[],
+                logprobs=None,
+                prompt_logprobs_dict={},
+                pooler_output=pooler_output,
+                **extra_args,
+            )
+        return modelrunner_output
 
     @torch.inference_mode()
     def execute_model(
@@ -1548,7 +1566,6 @@ class NPUModelRunner(LoRAModelRunnerMixin):
         intermediate_tensors: Optional[IntermediateTensors] = None,
     ) -> Union[ModelRunnerOutput, torch.Tensor]:
         with ProfileExecuteDuration().capture_async("prepare input"):
-            #logger.info(f"scheduler_output{scheduler_output}")
             self._update_states(scheduler_output)
             if not scheduler_output.total_num_scheduled_tokens:
                 if not has_kv_transfer_group():
@@ -1762,15 +1779,27 @@ class NPUModelRunner(LoRAModelRunnerMixin):
 
         extra_args = ({"kv_connector_output": kv_connector_output})
 
-        model_runner_output = ModelRunnerOutput(
-            req_ids=self.input_batch.req_ids,
-            req_id_to_index=self.input_batch.req_id_to_index,
-            sampled_token_ids=valid_sampled_token_ids,
-            logprobs=logprobs_lists,
-            prompt_logprobs_dict=prompt_logprobs_dict,
-            pooler_output=[],
-            **extra_args,
-        )
+        if vllm_version_is("0.10.1.1"):
+            model_runner_output = ModelRunnerOutput(
+                req_ids=self.input_batch.req_ids,
+                req_id_to_index=self.input_batch.req_id_to_index,
+                sampled_token_ids=valid_sampled_token_ids,
+                logprobs=logprobs_lists,
+                spec_token_ids=self._draft_token_ids,
+                prompt_logprobs_dict=prompt_logprobs_dict,
+                pooler_output=[],
+                **extra_args,
+            )
+        else:
+            model_runner_output = ModelRunnerOutput(
+                req_ids=self.input_batch.req_ids,
+                req_id_to_index=self.input_batch.req_id_to_index,
+                sampled_token_ids=valid_sampled_token_ids,
+                logprobs=logprobs_lists,
+                prompt_logprobs_dict=prompt_logprobs_dict,
+                pooler_output=[],
+                **extra_args,
+            )
 
         durations = ProfileExecuteDuration().pop_captured_sync()
         if durations:
@@ -2544,80 +2573,6 @@ class NPUModelRunner(LoRAModelRunnerMixin):
             token_indices=token_indices)
         spec_token_ids = draft_token_ids.tolist()
         return spec_token_ids
-
-    # def _generate_mtp_token_ids(
-    #     self,
-    #     valid_sampled_token_ids: list[list[int]],
-    #     sampling_metadata: SamplingMetadata,
-    #     scheduler_output: "SchedulerOutput",
-    #     spec_decode_metadata: SpecDecodeMetadata,
-    #     positions: torch.Tensor,
-    #     num_scheduled_tokens: int,
-    #     hidden_states: torch.Tensor,
-    #     attn_metadata: Union[AscendMetadata, AscendMLAMetadata,
-    #                          AscendTorchairMetadata],
-    # ):
-    #     assert isinstance(self.drafter, MtpProposer)
-    #     next_token_ids: list[int] = []
-    #     for i, token_ids in enumerate(valid_sampled_token_ids):
-    #         if token_ids:
-    #             # Common case.
-    #             next_token_id = token_ids[-1]
-    #         else:
-    #             # Partial prefill (rare case).
-    #             # Get the next token id from the request state.
-    #             req_id = self.input_batch.req_ids[i]
-    #             req_state = self.requests[req_id]
-    #             seq_len = (req_state.num_computed_tokens +
-    #                        scheduler_output.num_scheduled_tokens[req_id])
-    #             next_token_id = req_state.get_token_id(seq_len)
-    #         next_token_ids.append(next_token_id)
-    #     next_token_ids = torch.tensor(next_token_ids,
-    #                                   dtype=torch.int32,
-    #                                   device=self.device)
-    #     accepted_token_indices = None
-    #     if spec_decode_metadata is None:
-    #         # input_ids can be None for multimodal models.
-    #         target_token_ids = self.input_ids[:num_scheduled_tokens]
-    #         target_positions = positions[:num_scheduled_tokens]
-    #         target_hidden_states = hidden_states[:num_scheduled_tokens]
-    #         target_slot_mapping = attn_metadata.slot_mapping
-    #         cu_num_tokens = attn_metadata.query_start_loc
-    #     else:
-    #         # TODO(woosuk): Refactor this.
-    #         num_draft_tokens = spec_decode_metadata.num_draft_tokens
-    #         num_rejected_tokens = [
-    #             n + 1 - len(valid_sampled_token_ids[i]) if n > 0 else 0
-    #             for i, n in enumerate(num_draft_tokens)
-    #         ]
-    #         num_rejected_tokens = torch.tensor(
-    #             num_rejected_tokens,
-    #             dtype=torch.int32,
-    #             device=self.device,
-    #         )
-    #         cu_num_tokens, accepted_token_indices, target_token_ids, \
-    #             target_positions, target_hidden_states, target_slot_mapping = self.drafter.prepare_inputs(
-    #             attn_metadata.query_start_loc,
-    #             num_rejected_tokens,
-    #             self.input_ids[:num_scheduled_tokens],
-    #             positions[:num_scheduled_tokens],
-    #             hidden_states[:num_scheduled_tokens],
-    #             attn_metadata.slot_mapping[:num_scheduled_tokens],
-    #             is_torchair_graph=self.torchair_graph_enabled,
-    #         )
-
-        # draft_token_ids = self.drafter.propose(
-        #     target_token_ids=target_token_ids,
-        #     target_positions=target_positions,
-        #     target_hidden_states=target_hidden_states,
-        #     target_slot_mapping=target_slot_mapping,
-        #     next_token_ids=next_token_ids,
-        #     cu_num_tokens=cu_num_tokens,
-        #     block_table=attn_metadata.block_tables,
-        #     sampling_metadata=sampling_metadata,
-        #     token_indices=accepted_token_indices)
-        # spec_token_ids = draft_token_ids.tolist()
-        # return spec_token_ids
 
     def _get_prompt_logprobs_dict(
         self,

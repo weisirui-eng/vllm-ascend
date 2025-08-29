@@ -77,15 +77,17 @@ class EagleProposer(Proposer):
             attn_mask_len, self.vllm_config.model_config.dtype)
 
     def load_model(self, model: nn.Module) -> None:
-        self.model = get_model(vllm_config=self.vllm_config,
-                               model_config=self.vllm_config.
-                               speculative_config.draft_model_config)
-
         target_attn_layer_names = set(
             get_layers_from_vllm_config(self.vllm_config, Attention).keys())
+
+        self.model = get_model(vllm_config=self.vllm_config,
+                               model_config=self.vllm_config.speculative_config.draft_model_config)
+
         draft_attn_layer_names = (
             get_layers_from_vllm_config(self.vllm_config, Attention).keys() -
             target_attn_layer_names)
+
+        self.attn_layer_names = list(draft_attn_layer_names)
         self.attn_layer_name = next(iter(draft_attn_layer_names))
 
         # share embed_tokens with the target model if needed

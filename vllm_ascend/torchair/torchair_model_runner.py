@@ -38,6 +38,7 @@ from vllm_ascend.torchair.utils import (TorchairCommonAttentionMetadata,
                                         check_torchair_cache_exist,
                                         converting_weight_acl_format,
                                         register_torchair_model,
+                                        torchair_quant_method_register,
                                         write_kv_cache_bytes_to_file)
 from vllm_ascend.utils import (ACL_FORMAT_FRACTAL_ND, ACL_FORMAT_FRACTAL_NZ,
                                is_310p)
@@ -67,8 +68,9 @@ class NPUTorchairModelRunner(NPUModelRunner):
 
         self._check_batch_sizes_consistency()
         register_torchair_model()
+        torchair_quant_method_register()
 
-    def _get_forward_metadata_across_dp_and_pad(
+    def _sync_metadata_across_dp(
             self, num_tokens: int, with_prefill: bool, enable_dbo: bool
     ) -> tuple[int, Optional[torch.Tensor], bool, bool]:
         """Override from NPUModelRunner to pad num_tokens"""
@@ -79,8 +81,17 @@ class NPUTorchairModelRunner(NPUModelRunner):
                 return maybe_padded_num_tokens, None, with_prefill, enable_dbo
             return num_tokens, None, with_prefill, enable_dbo
 
-        num_tokens_across_dp, with_prefill, enable_dbo = self._get_forward_metadata_across_dp(
-            num_tokens, with_prefill, enable_dbo)
+        num_tokens_across_dp = torch.zeros(self.dp_size + 2,
+                                           dtype=torch.int32,
+                                           device="npu")
+        num_tokens_across_dp[self.dp_rank] = num_tokens
+        num_tokens_across_dp[-2] = int(with_prefill)
+        num_tokens_across_dp[-1] = int(not enable_dbo)
+        dist.all_reduce(num_tokens_across_dp,
+                        group=get_dp_group().device_group)
+        with_prefill = bool(num_tokens_across_dp[-2])
+        enable_dbo = not bool(num_tokens_across_dp[-1])
+        num_tokens_across_dp = num_tokens_across_dp[:-2]
 
         if not with_prefill:
             max_num_token = num_tokens_across_dp.max().item()
@@ -419,3 +430,7 @@ class NPUTorchairModelRunner(NPUModelRunner):
 
     def _build_drafter_prepare_inputs_torchair_param(self):
         return True
+
+    def get_dp_padding(self, num_tokens):
+        """Override from NPUModelRunner to get dp padding"""
+        return 0, None

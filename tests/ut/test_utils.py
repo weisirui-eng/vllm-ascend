@@ -255,6 +255,9 @@ class TestUtils(TestBase):
             parallel_config=test_parallel_config,
         )
         utils.update_aclgraph_sizes(test_vllm_config)
+        os.environ['HCCL_OP_EXPANSION_MODE'] = 'AIV'
+        utils.update_aclgraph_sizes(test_vllm_config)
+        del os.environ['HCCL_OP_EXPANSION_MODE']
         self.assertEqual(
             147,
             len(test_vllm_config.compilation_config.cudagraph_capture_sizes))
@@ -267,6 +270,9 @@ class TestUtils(TestBase):
             parallel_config=test_parallel_config,
         )
         utils.update_aclgraph_sizes(test_vllm_config)
+        os.environ['HCCL_OP_EXPANSION_MODE'] = 'AIV'
+        utils.update_aclgraph_sizes(test_vllm_config)
+        del os.environ['HCCL_OP_EXPANSION_MODE']
         self.assertEqual(
             3,
             len(test_vllm_config.compilation_config.cudagraph_capture_sizes))
@@ -283,13 +289,13 @@ class TestUtils(TestBase):
         # ascend custom op is not registered
         utils.register_ascend_customop()
         # should call register_oot three
-        self.assertEqual(mock_customop.register_oot.call_count, 8)
+        self.assertEqual(mock_customop.register_oot.call_count, 10)
         self.assertTrue(utils._ASCEND_CUSTOMOP_IS_REIGISTERED)
 
         # ascend custom op is already registered
         utils.register_ascend_customop()
         # should not register_oot again, thus only called three in this ut
-        self.assertEqual(mock_customop.register_oot.call_count, 8)
+        self.assertEqual(mock_customop.register_oot.call_count, 10)
 
 
 class TestProfileExecuteDuration(TestBase):

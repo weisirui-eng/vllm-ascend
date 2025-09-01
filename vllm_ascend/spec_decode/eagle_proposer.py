@@ -16,12 +16,13 @@ from vllm.model_executor.models.llama_eagle3 import Eagle3LlamaForCausalLM
 from vllm.v1.core.sched.output import SchedulerOutput
 from vllm.v1.sample.metadata import SamplingMetadata
 from vllm.v1.spec_decode.metadata import SpecDecodeMetadata
-
 from vllm_ascend.ascend_forward_context import set_ascend_forward_context
 from vllm_ascend.attention.attention_mask import AttentionMaskBuilder
 from vllm_ascend.attention.attention_v1 import AscendAttentionState
 from vllm_ascend.attention.utils import AscendCommonAttentionMetadata
 from vllm_ascend.spec_decode.interface import Proposer, SpecDcodeType
+from vllm_ascend.torchair.utils import TorchairCommonAttentionMetadata
+from vllm_ascend.utils import ProfileExecuteDuration
 
 PADDING_SLOT_ID = -1
 
@@ -32,7 +33,12 @@ class EagleProposer(Proposer):
                  vllm_config: VllmConfig,
                  device: torch.device,
                  runner=None):
-        self.name = SpecDcodeType.EAGLE if vllm_config.speculative_config.method == "eagle" else SpecDcodeType.EAGLE3
+        if vllm_config.speculative_config.method == "eagle":
+            self.name = SpecDcodeType.EAGLE
+        elif vllm_config.speculative_config.method == "eagle3":
+            self.name = SpecDcodeType.EAGLE3
+        else:
+            self.name = SpecDcodeType.MTP
         self.vllm_config = vllm_config
         self.device = device
         self.runner = runner
@@ -64,7 +70,11 @@ class EagleProposer(Proposer):
             (self.vllm_config.scheduler_config.max_num_batched_tokens,
              self.hidden_size),
             dtype=self.vllm_config.model_config.dtype,
-            device=device)
+            device=device) if self.name == SpecDcodeType.EAGLE3 else torch.zeros(
+            (self.runner.max_num_tokens,
+             vllm_config.model_config.get_hidden_size()),
+            dtype=self.runner.dtype,
+            device=self.device)
         # We need +1 here because the arange is used to set query_start_loc,
         # which has one more element than batch_size.
         self.arange = torch.arange(vllm_config.scheduler_config.max_num_seqs +
@@ -113,6 +123,7 @@ class EagleProposer(Proposer):
             else:
                 self.model.lm_head = model.lm_head
 
+
     @torch.inference_mode()
     def dummy_run(self,
                   num_tokens: int,
@@ -120,13 +131,48 @@ class EagleProposer(Proposer):
                   skip_attn: bool = False,
                   num_reqs: int = 0,
                   num_tokens_across_dp: Optional[torch.Tensor] = None):
-        with set_ascend_forward_context(None,
+        if self.name == SpecDcodeType.MTP:
+            # TODO: adapt enable_dbo later
+            (num_tokens, num_tokens_across_dp, with_prefill,
+             _) = self.runner._sync_metadata_across_dp(
+                 num_tokens, with_prefill, False)
+            if skip_attn:
+                attn_metadata = None
+            else:
+                common_attn_metadata = TorchairCommonAttentionMetadata(
+                    num_reqs=num_reqs,
+                    num_actual_tokens=1,
+                    actual_seq_lengths_q=self.runner.actual_seq_lengths_q,
+                    attn_mask=self.runner.attn_mask,
+                    spec_attn_mask=self.runner.spec_attn_mask,
+                    decode_token_per_req=self.runner.decode_token_per_req,
+                )
+                attn_metadata = self.runner.attn_metadata_builder.build_torchair_graph_dummy(
+                    common_attn_metadata)
+
+            input_ids = self.input_ids[:num_tokens]
+            positions = self.positions[:num_tokens]
+            previous_hidden_states = self.hidden_states[:num_tokens]
+            with set_ascend_forward_context(
+                    attn_metadata,
+                    self.vllm_config,
+                    num_tokens=num_tokens,
+                    with_prefill=with_prefill,
+                    num_tokens_across_dp=num_tokens_across_dp,
+                    reserved_mc2_mask=self.runner.reserved_mc2_mask,
+                    in_profile_run=self.runner.in_profile_run,
+                    num_actual_tokens=0):
+                self.model(input_ids=input_ids,
+                           positions=positions,
+                           previous_hidden_states=previous_hidden_states)
+        else:
+            with set_ascend_forward_context(None,
                                         self.vllm_config,
                                         num_tokens=num_tokens):
-            self.model(
-                input_ids=self.input_ids[:num_tokens],
-                positions=self.positions[:num_tokens],
-                hidden_states=self.hidden_states[:num_tokens],
+                self.model(
+                    input_ids=self.input_ids[:num_tokens],
+                    positions=self.positions[:num_tokens],
+                    hidden_states=self.hidden_states[:num_tokens],
             )
 
     def generate_token_ids(self,
@@ -142,7 +188,7 @@ class EagleProposer(Proposer):
         if self.name == SpecDcodeType.EAGLE:
             raise NotImplementedError("Eagle Is Not Supported Yet.")
 
-        attn_metadata = self._get_eagle_atten_dict(scheduler_output)
+        attn_metadata = self._get_eagle_atten_dict(scheduler_output) if self.name == SpecDcodeType.EAGLE3 else attn_metadata
         next_token_ids: list[int] = []
         for i, token_ids in enumerate(valid_sampled_token_ids):
             if token_ids:
@@ -161,7 +207,7 @@ class EagleProposer(Proposer):
         next_token_ids = torch.tensor(next_token_ids,
                                       dtype=torch.int32,
                                       device=self.device)
-        eagle_attn_metadata = attn_metadata[self.attn_layer_name]
+        eagle_attn_metadata = attn_metadata[self.attn_layer_name] if self.name == SpecDcodeType.EAGLE3 else attn_metadata
         if spec_decode_metadata is None:
             # input_ids can be None for multimodal models.
             target_token_ids = self.runner.input_ids[:num_scheduled_tokens]
@@ -417,16 +463,18 @@ class EagleProposer(Proposer):
         self.input_ids[:num_tokens - 1] = target_token_ids[1:]
         # Replace the last token with the next token.
         # E.g., [b1, b2, c1, c2, c3, c3] -> [a2, b2, b3, c2, c3, c4]
-        self.input_ids[last_token_indices] = next_token_ids[0]
+        self.input_ids[last_token_indices] = next_token_ids
 
         query_lens = cu_num_tokens[1:] - cu_num_tokens[:-1]
         max_query_len = query_lens.max().item()
 
+        seq_lens = target_positions[last_token_indices] + 1
+        seq_lens = seq_lens.int()
         common_attn_metadata = AscendCommonAttentionMetadata(
-            query_start_loc=self.runner.query_start_loc[:batch_size + 1],
+            query_start_loc=self.runner.query_start_loc[:batch_size + 1] if self.name != SpecDcodeType.MTP else cu_num_tokens[:batch_size + 1],
             query_start_loc_cpu=self.runner.query_start_loc_cpu[:batch_size +
-                                                                1],
-            seq_lens_cpu=self.runner.seq_lens_cpu,
+                                                                1]  if self.name != SpecDcodeType.MTP else cu_num_tokens[:batch_size + 1].cpu(),
+            seq_lens_cpu=self.runner.seq_lens_cpu if self.name != SpecDcodeType.MTP else seq_lens.cpu(),
             max_query_len=max_query_len,
             num_reqs=batch_size,
             num_actual_tokens=num_tokens,
@@ -438,28 +486,55 @@ class EagleProposer(Proposer):
             attn_mask=self.runner.attn_mask,
             spec_attn_mask=self.runner.spec_attn_mask,
             attn_state=self.runner.attn_state,
+            graph_pad_size=self.runner.graph_pad_size,
             decode_token_per_req=self.runner.decode_token_per_req,
         )
         # FIXME(woosuk): The below two ops cause synchronization. Optimize.
         attn_metadata = self.runner.attn_metadata_builder.build(
             common_attn_metadata, self.runner.model)
         if self.use_cuda_graph and \
-            num_tokens <= self.cudagraph_batch_sizes[-1]:
+            num_tokens <= self.cudagraph_batch_sizes[-1] and self.name != SpecDcodeType.MTP:
             num_input_tokens = self.vllm_config.pad_for_cudagraph(num_tokens)
         else:
             num_input_tokens = num_tokens
         # copy inputs to buffer for cudagraph
         self.positions[:num_tokens] = target_positions.to(device)
         self.hidden_states[:num_tokens] = target_hidden_states
-        attn_metadata.block_tables = block_table.to(device)
-        with set_ascend_forward_context(attn_metadata,
+        if self.name == SpecDcodeType.MTP:
+            logger.info(f"Runner._propose MTP  {num_tokens}")
+            (num_input_tokens, num_tokens_across_dp, with_prefill,
+             _) = self.runner._sync_metadata_across_dp(
+                num_tokens, self.runner.with_prefill, False)
+            logger.info(f"Runner._propose MTP num_input_tokens {num_input_tokens}")
+            attn_metadata.slot_mapping = target_slot_mapping
+            with set_ascend_forward_context(
+                    attn_metadata,
+                    self.vllm_config,
+                    num_tokens=num_input_tokens,
+                    with_prefill=with_prefill,
+                    num_tokens_across_dp=num_tokens_across_dp,
+                    reserved_mc2_mask=self.runner.reserved_mc2_mask,
+                    in_profile_run=self.runner.in_profile_run,
+                    num_actual_tokens=num_tokens):
+                with ProfileExecuteDuration().capture_async('mtp_forward'):
+                    model_kwargs = {}
+                    model_kwargs["attn_metadata"] = attn_metadata
+                    last_hidden_states = self.model(
+                        input_ids=self.input_ids[:num_input_tokens],
+                        positions=self.positions[:num_input_tokens],
+                        previous_hidden_states=self.
+                                               hidden_states[:num_input_tokens],
+                        kv_caches=self.runner.kv_caches[-1:])
+        else:
+            attn_metadata.block_tables = block_table.to(device)
+            with set_ascend_forward_context(attn_metadata,
                                         self.vllm_config,
                                         num_tokens=num_input_tokens):
-            last_hidden_states, hidden_states = self.model(
-                input_ids=self.input_ids[:num_input_tokens],
-                positions=self.positions[:num_input_tokens],
-                hidden_states=self.hidden_states[:num_input_tokens],
-            )
+                last_hidden_states, hidden_states = self.model(
+                    input_ids=self.input_ids[:num_input_tokens],
+                    positions=self.positions[:num_input_tokens],
+                    hidden_states=self.hidden_states[:num_input_tokens],
+                )
         sample_hidden_states = last_hidden_states[last_token_indices]
         logits = self.model.compute_logits(sample_hidden_states, None)
         draft_token_ids = logits.argmax(dim=-1)
@@ -546,7 +621,7 @@ class EagleProposer(Proposer):
             self.hidden_states[:batch_size] = hidden_states
             positions = positions_cpu.to(device)
             attn_mask = self.attn_mask_builder.get_splitfuse_attn_mask(
-                attn_metadata.seq_lens, attn_metadata.max_query_len, positions,
+                attn_metadata.seq_lens,  positions,
                 self.vllm_config.model_config.dtype, self.device)
 
             attn_metadata.attn_mask = attn_mask
@@ -599,6 +674,7 @@ class EagleProposer(Proposer):
         # [0, a - n1, a + b - n1 - n2, a + b + c - n1 - n2 - n3]
         cu_num_tokens = torch.zeros_like(cu_target_query_lens)
         torch.cumsum(num_tokens_per_req, dim=0, out=cu_num_tokens[1:])
+        cu_num_tokens[0] = 0
         token_indices = torch.empty(
             num_tokens,
             dtype=torch.int32,
@@ -617,29 +693,19 @@ class EagleProposer(Proposer):
                                         cu_query_lens: torch.Tensor,
                                         cu_num_tokens: torch.Tensor,
                                         block_size: int):
-        num_programs = len(cu_num_tokens) - 1
-        for pid in range(num_programs):
-            start_pos = cu_num_tokens[pid].item()
-            end_pos = cu_num_tokens[pid + 1].item()
-            num_tokens = end_pos - start_pos
-            index_start = cu_query_lens[pid].item()
-            num_blocks = int(
-                torch.ceil(torch.tensor(num_tokens / block_size)).item())
+        device = cu_query_lens.device
+        dtype = out_tensor.dtype
 
-            for i in range(num_blocks):
-                offset_tensor = torch.arange(0,
-                                             block_size,
-                                             dtype=torch.int32,
-                                             device=out_tensor.device)
-                global_start_offset = i * block_size
-                target_indices = torch.tensor(
-                    start_pos + global_start_offset,
-                    dtype=torch.int32,
-                    device=out_tensor.device) + offset_tensor
-                values_to_store = torch.tensor(
-                    index_start, dtype=torch.int32,
-                    device=out_tensor.device) + offset_tensor
-                mask = (target_indices >= start_pos) & \
-                    (target_indices < end_pos) & \
-                    (offset_tensor < num_tokens)
-                out_tensor[target_indices[mask]] = values_to_store[mask]
+        offsets = torch.arange(block_size, device=device, dtype=dtype)
+        start_pos = cu_num_tokens[:-1]
+        end_pos = cu_num_tokens[1:]
+        num_tokens = end_pos - start_pos
+
+        global_indices = (start_pos.view(-1, 1) + offsets.view(1, -1))
+        values = (cu_query_lens[:-1].view(-1, 1) + offsets.view(1, -1))
+
+        mask = (offsets.view(1, -1) < num_tokens.view(-1, 1))
+
+        global_indices_flat = global_indices[mask]
+        values_flat = values[mask]
+        out_tensor[global_indices_flat] = values_flat

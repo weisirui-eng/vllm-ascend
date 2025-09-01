@@ -202,6 +202,7 @@ class NPUModelRunner(LoRAModelRunnerMixin):
         self.intermediate_tensors: Optional[IntermediateTensors] = None
 
         ascend_config = get_ascend_config()
+        is_torchair_graph=ascend_config.torchair_graph_config.enabled
         if ascend_config.ascend_scheduler_config.enabled:
             self.chunked_prefill_enabled = self.scheduler_config.chunked_prefill_enabled
         else:
@@ -256,8 +257,8 @@ class NPUModelRunner(LoRAModelRunnerMixin):
                                              diagonal=1).to(self.device)
             if get_pp_group().is_last_rank:
                 self.drafter = get_spec_decode_method(
-                    self.speculative_config.method, self.vllm_config,
-                    self.device, self)
+                    self.speculative_config.method,self.vllm_config,
+                    self.device,self,is_torchair_graph)
                 self.rejection_sampler = AscendRejectionSampler()
 
         # Persistent batch.

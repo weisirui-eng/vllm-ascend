@@ -26,7 +26,7 @@ from vllm_ascend.spec_decode.interface import Proposer, SpecDcodeType
 from vllm_ascend.torchair.torchair_attention import AscendTorchairMetadata
 from vllm_ascend.torchair.torchair_mla import AscendMLATorchairMetadata
 from vllm_ascend.torchair.utils import TorchairCommonAttentionMetadata
-from vllm_ascend.utils import ProfileExecuteDuration
+from vllm_ascend.utils import ProfileExecuteDuration, lmhead_tp_enable
 
 PADDING_SLOT_ID = -1
 
@@ -506,11 +506,9 @@ class EagleProposer(Proposer):
         self.positions[:num_tokens] = target_positions.to(device)
         self.hidden_states[:num_tokens] = target_hidden_states
         if self.name == SpecDcodeType.MTP:
-            logger.info(f"Runner._propose MTP  {num_tokens}")
             (num_input_tokens, num_tokens_across_dp, with_prefill,
              _) = self.runner._sync_metadata_across_dp(
                 num_tokens, self.runner.with_prefill, False)
-            logger.info(f"Runner._propose MTP num_input_tokens {num_input_tokens}")
             attn_metadata.slot_mapping = target_slot_mapping
             with set_ascend_forward_context(
                     attn_metadata,
@@ -530,6 +528,14 @@ class EagleProposer(Proposer):
                         previous_hidden_states=self.
                                                hidden_states[:num_input_tokens],
                         kv_caches=self.runner.kv_caches[-1:])
+            num_indices = last_token_indices.shape[0]
+            if lmhead_tp_enable():
+                if not self.runner.with_prefill:
+                    max_num_reqs_across_dp = num_input_tokens
+                else:
+                    max_num_reqs_across_dp = self.vllm_config.scheduler_config.max_num_seqs
+                last_token_indices = nn.functional.pad(
+                    last_token_indices, (0, max_num_reqs_across_dp - num_indices))
         else:
             attn_metadata.block_tables = block_table.to(device)
             with set_ascend_forward_context(attn_metadata,
@@ -542,6 +548,8 @@ class EagleProposer(Proposer):
                 )
         sample_hidden_states = last_hidden_states[last_token_indices]
         logits = self.model.compute_logits(sample_hidden_states, None)
+        if lmhead_tp_enable() and num_indices < logits.shape[0] and self.name == SpecDcodeType.MTP:
+            logits = logits[:num_indices]
         draft_token_ids = logits.argmax(dim=-1)
 
         # Early exit if there is only one draft token to be generated.
@@ -628,7 +636,6 @@ class EagleProposer(Proposer):
             attn_mask = self.attn_mask_builder.get_splitfuse_attn_mask(
                 attn_metadata.seq_lens,  positions_cpu,
                 self.vllm_config.model_config.dtype, self.device)
-            logger.info(f"Runner._propose {attn_mask}")
             attn_metadata.attn_mask = attn_mask
             attn_metadata.block_tables = block_table.to(device)
             # Run the model.
@@ -644,7 +651,6 @@ class EagleProposer(Proposer):
             hidden_states = hidden_states[:batch_size]
             logits = self.model.compute_logits(last_hidden_states[:batch_size],
                                                None)
-            logger.info(f"last_hidden_states {last_hidden_states}")
             # TODO(wenlong): get more than one token for tree attention
             draft_token_ids = logits.argmax(dim=-1)
 

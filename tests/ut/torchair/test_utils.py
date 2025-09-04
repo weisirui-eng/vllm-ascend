@@ -49,13 +49,23 @@ class TestTorchairUtils(TestBase):
         self.assertFalse(utils.check_kv_cache_bytes_cache_exist(),
                          "Delete kv cache bytes cache dir failed")
 
+    def test_delete_torchair_cache_file_multiple_times(self):
+        utils.write_kv_cache_bytes_to_file(0, 100)
+        utils.delete_torchair_cache_file()
+        for i in range(5):
+            try:
+                utils.delete_torchair_cache_file()
+            except FileNotFoundError:
+                self.fail(
+                    f"Unexpected FileNotFoundError on delete call #{i+2}")
+
     @patch('vllm.ModelRegistry')
     def test_register_torchair_model(self, mock_model_registry):
         mock_registry = MagicMock()
         mock_model_registry.return_value = mock_registry
         utils.register_torchair_model()
 
-        self.assertEqual(mock_model_registry.register_model.call_count, 5)
+        self.assertEqual(mock_model_registry.register_model.call_count, 6)
         call_args_list = mock_model_registry.register_model.call_args_list
 
         expected_registrations = [
@@ -71,7 +81,11 @@ class TestTorchairUtils(TestBase):
             ("Qwen2ForCausalLM",
              "vllm_ascend.torchair.models.qwen2:CustomQwen2ForCausalLM"),
             ("Qwen3MoeForCausalLM",
-             "vllm_ascend.torchair.models.qwen3_moe:CustomQwen3MoeForCausalLM")
+             "vllm_ascend.torchair.models.qwen3_moe:CustomQwen3MoeForCausalLM"
+             ),
+            ("PanguProMoEForCausalLM",
+             "vllm_ascend.torchair.models.torchair_pangu_moe:PanguProMoEForCausalLM"
+             )
         ]
 
         for i, (expected_name,

@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 import os
-from typing import Optional
+from typing import Optional, Union
 
 import numpy as np
 import torch
@@ -10,6 +10,7 @@ from vllm.config import (CompilationLevel, VllmConfig,
                          get_layers_from_vllm_config)
 from vllm.distributed.parallel_state import get_pp_group
 from vllm.logger import logger
+from vllm.utils import is_pin_memory_available
 from vllm.model_executor.model_loader import get_model
 from vllm.model_executor.models import supports_multimodal
 from vllm.model_executor.models.llama_eagle3 import Eagle3LlamaForCausalLM
@@ -18,9 +19,12 @@ from vllm.v1.sample.metadata import SamplingMetadata
 from vllm.v1.spec_decode.metadata import SpecDecodeMetadata
 from vllm_ascend.ascend_forward_context import set_ascend_forward_context
 from vllm_ascend.attention.attention_mask import AttentionMaskBuilder
-from vllm_ascend.attention.attention_v1 import AscendAttentionState
+from vllm_ascend.attention.attention_v1 import AscendAttentionState, AscendMetadata
+from vllm_ascend.attention.mla_v1 import AscendMLAMetadata
 from vllm_ascend.attention.utils import AscendCommonAttentionMetadata
 from vllm_ascend.spec_decode.interface import Proposer, SpecDcodeType
+from vllm_ascend.torchair.torchair_attention import AscendTorchairMetadata
+from vllm_ascend.torchair.torchair_mla import AscendMLATorchairMetadata
 from vllm_ascend.torchair.utils import TorchairCommonAttentionMetadata
 from vllm_ascend.utils import ProfileExecuteDuration
 
@@ -66,6 +70,9 @@ class EagleProposer(Proposer):
             self.vllm_config.scheduler_config.max_num_batched_tokens,
             dtype=torch.int64,
             device=device)
+        self.max_num_tokens = (
+            vllm_config.scheduler_config.max_num_batched_tokens)
+        self.token_arange_np = np.arange(self.max_num_tokens)
         self.hidden_states = torch.zeros(
             (self.vllm_config.scheduler_config.max_num_batched_tokens,
              self.hidden_size),
@@ -231,17 +238,15 @@ class EagleProposer(Proposer):
                 dtype=torch.int32,
                 device=self.device,
             )
-            num_tokens = num_scheduled_tokens - sum(num_rejected_tokens)
-            cu_num_tokens, token_indices = self._prepare_inputs(
-                eagle_attn_metadata.query_start_loc, num_rejected_tokens,
-                num_tokens)
+            num_rejected_tokens_cpu = num_rejected_tokens.cpu()
+            cu_num_tokens, token_indices = self._prepare_inputs(eagle_attn_metadata,num_rejected_tokens_cpu)
             target_token_ids = self.runner.input_ids[token_indices]
             target_positions = positions[token_indices]
             if self.name == SpecDcodeType.EAGLE3:
                 target_hidden_states = torch.cat(
                     [h[token_indices] for h in aux_hidden_states], dim=-1)
             else:
-                target_hidden_states = hidden_states[token_indices]
+                target_hidden_states = hidden_states[token_indices.to(self.device)]
             target_slot_mapping = eagle_attn_metadata.slot_mapping[
                 token_indices]
 
@@ -619,11 +624,11 @@ class EagleProposer(Proposer):
             self.input_ids[:batch_size] = input_ids
             self.positions[:batch_size] = clamped_positions
             self.hidden_states[:batch_size] = hidden_states
-            positions = positions_cpu.to(device)
+            # positions = positions_cpu.to(device)
             attn_mask = self.attn_mask_builder.get_splitfuse_attn_mask(
-                attn_metadata.seq_lens,  positions,
+                attn_metadata.seq_lens,  positions_cpu,
                 self.vllm_config.model_config.dtype, self.device)
-
+            logger.info(f"Runner._propose {attn_mask}")
             attn_metadata.attn_mask = attn_mask
             attn_metadata.block_tables = block_table.to(device)
             # Run the model.
@@ -639,9 +644,10 @@ class EagleProposer(Proposer):
             hidden_states = hidden_states[:batch_size]
             logits = self.model.compute_logits(last_hidden_states[:batch_size],
                                                None)
-
+            logger.info(f"last_hidden_states {last_hidden_states}")
             # TODO(wenlong): get more than one token for tree attention
             draft_token_ids = logits.argmax(dim=-1)
+
             draft_token_ids_tensor[now_speculative + 1] = draft_token_ids.cpu()
 
         # [batch_size, num_speculative_tokens]
@@ -650,44 +656,81 @@ class EagleProposer(Proposer):
 
     def _prepare_inputs(
         self,
-        # [batch_size + 1]
-        cu_target_query_lens: torch.Tensor,
+        common_attn_metadata:Union[AscendMetadata, AscendMLAMetadata,
+                             AscendTorchairMetadata,
+                             AscendMLATorchairMetadata],
         # [batch_size]
-        num_rejected_tokens: torch.Tensor,
-        num_tokens: int,
+        num_rejected_tokens: torch.Tensor
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        # cu_target_query_lens: [0, a, a + b, a + b + c]
-        # num_rejected_tokens: [n1, n2, n3]
-        # num_tokens_per_req: [a - n1, b - n2, c - n3]
-        # cu_num_tokens: [0, a - n1, a + b - n1 - n2, a + b + c - n1 - n2 - n3]
-        # token_indices: [0, 1, ..., a - n1 - 1,
-        #                 a, a + 1, ..., a + b - n2 - 1,
-        #                 a + b, a + b + 1, ..., a + b + c - n3 - 1]
+        """
+        This function is used to prepare the inputs for the spec decode.
+        It updates to the common_attn_metadata to account for the rejected
+        tokens (and newly sampled tokens). It also returns the token indices
+        of the tokens that should be fed to the speculator.
+        """
+        # E.g.
+        #  common_attn_metadata.query_start_loc{_cpu}:
+        #       [0, q1, q1 + q2, q1 + q2 + q3]
+        #  common_attn_metadata.seq_lens{_cpu}: [s1, s2, s3]
+        #  num_rejected_tokens: [n1, n2, n3]
+        # This function computes the intermediate values:
+        #  num_tokens_per_req: [q1 - n1, q2 - n2, q3 - n3]
+        # And returns:
+        #  common_attn_metadata.query_start_loc{_cpu}:
+        #       [0, q1 - n1, q1 + q2 - n1 - n2, q1 + q2 + q3 - n1 - n2 - n3]
+        #  common_attn_metadata.seq_lens{_cpu}:
+        #       [s1 - n1 + 1, s2 - n2 + 1, s3 - n3 + 1]
+        #  token_indices: [0, 1, ..., q1 - n1 - 1,
+        #                 q1, q1 + 1, ..., q1 + q2 - n2 - 1,
+        #                 q1 + q2, q1 + q2 + 1, ..., q1 + q2 + q3 - n3 - 1]
 
-        # [0, a, a + b, a + b + c] -> [a, b, c]
-        query_len_per_req = (cu_target_query_lens[1:] -
-                             cu_target_query_lens[:-1])
-        # [a, b, c] -> [a - n1, b - n2, c - n3]
-        num_tokens_per_req = query_len_per_req - num_rejected_tokens
+        device = common_attn_metadata.query_start_loc.device
+        query_start_loc_cpu = common_attn_metadata.query_start_loc.cpu()
+        # [0, q1, q1 + q2, q1 + q2 + q3] -> [q1, q2, q3]
+        new_query_len_per_req = (query_start_loc_cpu[1:] -
+                                 query_start_loc_cpu[:-1])
+        # [q1, q2, q3] -> [q1 - n1, q2 - n2, q3 - n3]
+        new_num_tokens_per_req = new_query_len_per_req - num_rejected_tokens
+        new_num_tokens_per_req_np = new_num_tokens_per_req.numpy()
 
-        # [a - n1, b - n2, c - n3] ->
-        # [0, a - n1, a + b - n1 - n2, a + b + c - n1 - n2 - n3]
-        cu_num_tokens = torch.zeros_like(cu_target_query_lens)
-        torch.cumsum(num_tokens_per_req, dim=0, out=cu_num_tokens[1:])
-        cu_num_tokens[0] = 0
-        token_indices = torch.empty(
-            num_tokens,
+        # [q1 - n1, q2 - n2, q3 - n3] ->
+        # [0, q1 - n1, q1 + q2 - n1 - n2, q1 + q2 + q3 - n1 - n2 - n3]
+        new_query_start_loc_cpu = torch.zeros(
+            query_start_loc_cpu.shape,
             dtype=torch.int32,
-            device=cu_target_query_lens.device,
-        )
-        BLOCK_SIZE = 1024
-        self._prepare_eagle_input_sequential(
-            token_indices,
-            cu_target_query_lens,
-            cu_num_tokens,
-            block_size=BLOCK_SIZE,
-        )
-        return cu_num_tokens, token_indices
+            pin_memory=is_pin_memory_available())
+        new_query_start_loc_np = new_query_start_loc_cpu.numpy()
+        np.cumsum(new_num_tokens_per_req_np, out=new_query_start_loc_np[1:])
+
+        total_num_tokens = new_query_start_loc_np[-1]
+        # Example assuming num_tokens_per_req_np = [2, 4, 3]
+        # this implies that `new_query_start_locs` is:
+        # [0, 2, 6, 9] ->
+        # [0, 0, 2, 2, 2, 2, 6, 6, 6]
+        #  _r1_  ____r2____  ___r3__
+        new_query_start_locs_expanded = np.repeat(new_query_start_loc_np[:-1],
+                                                  new_num_tokens_per_req_np)
+        # [0, 1, 2, 3, 4, 5, 6, 7, 8] ->
+        # [0, 1, 0, 1, 2, 3, 0, 1, 2]
+        #  _r1_  ____r2____  ___r3__
+        token_offests = self.token_arange_np[:total_num_tokens] \
+            - new_query_start_locs_expanded
+
+        # Expand starting positions to match token pattern
+        # [0, q1, q1 + q2] ->
+        # [0, 0, q1, q1, q1, q1, q1 + q2, q1 + q2, q1 + q2]
+        #  _r1_  _____r2_______  ___________r3____________
+        old_query_start_locs_expanded = np.repeat(
+            query_start_loc_cpu[:-1].numpy(), new_num_tokens_per_req_np)
+        # Final token indices are:
+        # [0, 1,                                // req 1
+        #  q1 + 0, q1 + 1, q1 + 2, q1 + 3,       // req 2
+        #  q1 + q2 + 0, q1 + q2 + 1, q1 + q2 + 2] // req 3
+        token_indices_np = token_offests + old_query_start_locs_expanded
+        token_indices = torch.from_numpy(token_indices_np).to(
+            device, non_blocking=True)
+
+        return new_query_start_loc_cpu.to(device,non_blocking=True), token_indices
 
     def _prepare_eagle_input_sequential(self, out_tensor: torch.Tensor,
                                         cu_query_lens: torch.Tensor,

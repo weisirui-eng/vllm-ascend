@@ -1,4 +1,5 @@
 import types
+from typing import Union
 
 import torch
 import torch.nn as nn
@@ -18,10 +19,15 @@ from vllm.v1.spec_decode.metadata import SpecDecodeMetadata
 
 from vllm_ascend.ascend_config import get_ascend_config
 from vllm_ascend.ascend_forward_context import set_ascend_forward_context
+from vllm_ascend.attention.attention_v1 import AscendMetadata
+from vllm_ascend.attention.mla_v1 import AscendMLAMetadata
 from vllm_ascend.attention.utils import AscendCommonAttentionMetadata
 from vllm_ascend.models.deepseek_mtp import CustomDeepSeekMTP
 from vllm_ascend.spec_decode import EagleProposer
 from vllm_ascend.spec_decode.interface import  SpecDcodeType
+from vllm_ascend.torchair.models.torchair_deepseek_mtp import TorchairDeepSeekMTP
+from vllm_ascend.torchair.torchair_attention import AscendTorchairMetadata
+from vllm_ascend.torchair.torchair_mla import AscendMLATorchairMetadata
 from vllm_ascend.torchair.utils import TorchairCommonAttentionMetadata
 from vllm_ascend.utils import ProfileExecuteDuration
 
@@ -29,13 +35,16 @@ from vllm_ascend.utils import ProfileExecuteDuration
 class EagleTorchairProposer(EagleProposer):
 
     def __init__(
-        self
+        self,
+        vllm_config: VllmConfig,
+        device: torch.device,
+        runner=None
     ):
+        super().__init__(vllm_config, device, runner)
 
+        self.block_size = vllm_config.cache_config.block_size
         self.torchair_compiled_model = None  # type: ignore
         self.torchair_compiled_models = {}  # type: ignore
-        self.torchair_graph_enabled = get_ascend_config(
-        ).torchair_graph_config.enabled
 
 
     @torch.inference_mode()
@@ -104,11 +113,14 @@ class EagleTorchairProposer(EagleProposer):
     def _prepare_inputs(
         self,
         # [batch_size + 1]
-        cu_target_query_lens: torch.Tensor,
+        common_attn_metadata: Union[AscendMetadata, AscendMLAMetadata,
+            AscendTorchairMetadata,
+            AscendMLATorchairMetadata],
         # [batch_size]
         num_rejected_tokens: torch.Tensor,
-        num_tokens = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
+        device = common_attn_metadata.query_start_loc.device
+        query_start_loc_cpu = common_attn_metadata.query_start_loc.cpu()
         # cu_target_query_lens: [0, a, a + b, a + b + c]
         # num_rejected_tokens: [n1, n2, n3]
         # num_tokens_per_req: [a - n1, b - n2, c - n3]
@@ -117,17 +129,42 @@ class EagleTorchairProposer(EagleProposer):
         #                 a, a + 1, ..., a + b - n2 - 1,
         #                 a + b, a + b + 1, ..., a + b + c - n3 - 1]
         # [0, a, a + b, a + b + c] -> [a, b, c]
-        query_len_per_req = (cu_target_query_lens[1:] -
-                             cu_target_query_lens[:-1])
+        query_len_per_req = (query_start_loc_cpu[1:] -
+                             query_start_loc_cpu[:-1])
         # [a, b, c] -> [a - n1, b - n2, c - n3]
-        num_tokens_per_req = query_len_per_req - num_rejected_tokens
 
-        cu_num_tokens = cu_target_query_lens
+
+        cu_num_tokens = query_start_loc_cpu
         relative_index = query_len_per_req - num_rejected_tokens - 1
         token_indices = cu_num_tokens[:-1] + relative_index
 
 
-        return cu_num_tokens, token_indices
+        return cu_num_tokens.to(device,non_blocking=True), token_indices
+
+    def load_model(self,model: nn.Module) -> None:
+        loader = get_model_loader(self.vllm_config.load_config)
+        target_attn_layer_names = set(
+            get_layers_from_vllm_config(self.vllm_config, Attention).keys())
+        draft_model_config = \
+            self.vllm_config.speculative_config.draft_model_config
+        target_device = self.vllm_config.device_config.device
+        with set_default_torch_dtype(
+                draft_model_config.dtype), set_current_vllm_config(
+            self.vllm_config):
+
+            self.model = TorchairDeepSeekMTP(
+                vllm_config=self.vllm_config).to(target_device)
+        draft_attn_layer_names = (
+                get_layers_from_vllm_config(self.vllm_config, Attention).keys() -
+                target_attn_layer_names)
+        assert len(draft_attn_layer_names) == 1
+        self.attn_layer_name = next(iter(draft_attn_layer_names))
+        self.model.load_weights(
+            loader.get_all_weights(
+                self.vllm_config.speculative_config.draft_model_config,
+                self.model))
+        process_weights_after_loading(self.model, draft_model_config,
+                                      target_device)
 
     def _propose(
             self,

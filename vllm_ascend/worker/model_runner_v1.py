@@ -582,7 +582,7 @@ class NPUModelRunner(LoRAModelRunnerMixin):
     def _sync_metadata_across_dp(
             self, num_tokens: int, with_prefill: bool, enable_dbo: bool
     ) -> tuple[int, Optional[torch.Tensor], bool, bool]:
-        if self.dp_size == 1:
+        if self.dp_size == 1 or self.vllm_config.model_config.enforce_eager:
             return num_tokens, None, with_prefill, enable_dbo
 
         # Sync num_tokens, with_prefill, enable_dbo across dp ranks
@@ -2398,39 +2398,6 @@ class NPUModelRunner(LoRAModelRunnerMixin):
         # This usually takes 5~20 seconds.
         logger.info("Graph capturing finished in %.0f secs, took %.2f GiB",
                     elapsed_time, npu_graph_size / (1 << 30))
-
-    def _generate_ngram_token_ids(
-        self,
-        sampled_token_ids: list[list[int]],
-    ) -> list[list[int]]:
-        # TODO(woosuk): Optimize.
-        draft_token_ids: list[list[int]] = []
-        for i, sampled_ids in enumerate(sampled_token_ids):
-            num_sampled_ids = len(sampled_ids)
-            if not num_sampled_ids:
-                # Skip speculative decoding.
-                draft_token_ids.append([])
-                continue
-
-            # Skip requests that require top-p, top-k, etc.
-            req_id = self.input_batch.req_ids[i]
-            if req_id in self.input_batch.spec_decode_unsupported_reqs:
-                draft_token_ids.append([])
-                continue
-
-            # Add sampled_token_ids to token_ids_cpu.
-            start_idx = self.input_batch.num_tokens_no_spec[i]
-            end_idx = start_idx + num_sampled_ids
-            self.input_batch.token_ids_cpu[i, start_idx:end_idx] = sampled_ids
-            assert isinstance(self.drafter, NgramProposer)
-            drafter_output = self.drafter.propose(
-                self.input_batch.token_ids_cpu[i, :end_idx])
-            if drafter_output is None or len(drafter_output) == 0:
-                draft_token_ids.append([])
-            else:
-                draft_token_ids.append(drafter_output.tolist())
-        return draft_token_ids
-
 
     def _get_prompt_logprobs_dict(
         self,

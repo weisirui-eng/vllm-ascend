@@ -130,7 +130,6 @@ class EagleProposer(Proposer):
             else:
                 self.model.lm_head = model.lm_head
 
-
     @torch.inference_mode()
     def dummy_run(self,
                   num_tokens: int,
@@ -632,7 +631,6 @@ class EagleProposer(Proposer):
             self.input_ids[:batch_size] = input_ids
             self.positions[:batch_size] = clamped_positions
             self.hidden_states[:batch_size] = hidden_states
-            # positions = positions_cpu.to(device)
             attn_mask = self.attn_mask_builder.get_splitfuse_attn_mask(
                 attn_metadata.seq_lens,  positions_cpu,
                 self.vllm_config.model_config.dtype, self.device)

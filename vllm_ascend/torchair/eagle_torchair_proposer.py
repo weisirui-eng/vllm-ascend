@@ -25,6 +25,7 @@ from vllm_ascend.attention.utils import AscendCommonAttentionMetadata
 
 from vllm_ascend.spec_decode import EagleProposer
 from vllm_ascend.spec_decode.eagle_proposer import PADDING_SLOT_ID
+from vllm_ascend.torchair.models.torchair_deepseek_mtp import TorchairDeepSeekMTP
 
 from vllm_ascend.torchair.torchair_attention import AscendTorchairMetadata
 from vllm_ascend.torchair.torchair_mla import AscendMLATorchairMetadata
@@ -335,6 +336,36 @@ class EagleTorchairProposer(EagleProposer):
                                previous_hidden_states=previous_hidden_states)
             if with_prefill:
                 break
+    def load_model(self, model) -> None:
+        loader = get_model_loader(self.vllm_config.load_config)
+
+        target_attn_layer_names = set(
+            get_layers_from_vllm_config(self.vllm_config, Attention).keys())
+        draft_model_config = \
+            self.vllm_config.speculative_config.draft_model_config
+        target_device = self.vllm_config.device_config.device
+
+        with set_default_torch_dtype(
+                draft_model_config.dtype), set_current_vllm_config(
+                    self.vllm_config):
+            self.model = TorchairDeepSeekMTP(
+                vllm_config=self.vllm_config).to(target_device)
+
+
+        draft_attn_layer_names = (
+            get_layers_from_vllm_config(self.vllm_config, Attention).keys() -
+            target_attn_layer_names)
+
+        assert len(draft_attn_layer_names) == 1
+        self.attn_layer_name = next(iter(draft_attn_layer_names))
+
+        self.model.load_weights(
+            loader.get_all_weights(
+                self.vllm_config.speculative_config.draft_model_config,
+                self.model))
+        process_weights_after_loading(self.model, draft_model_config,
+                                      target_device)
+
 
     def _get_torchair_lazy_compiled_model(self, batch_size: int):
         if batch_size < 0 or batch_size > self.runner.torchair_graph_batch_sizes[

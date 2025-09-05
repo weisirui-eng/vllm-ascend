@@ -858,3 +858,4 @@ class EagleProposer(Proposer):
             device, non_blocking=True)
 
         return new_query_start_loc_cpu.to(device,non_blocking=True), token_indices
+

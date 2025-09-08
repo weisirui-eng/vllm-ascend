@@ -472,8 +472,7 @@ class EagleTorchairProposer(EagleProposer):
                 dtype=torch.int32,
                 device=self.device,
             )
-            num_rejected_tokens_cpu = num_rejected_tokens.cpu()
-            cu_num_tokens, token_indices = self._prepare_inputs(attn_metadata, num_rejected_tokens_cpu)
+            cu_num_tokens, token_indices = self._prepare_inputs(attn_metadata, num_rejected_tokens)
             target_token_ids = self.runner.input_ids[:num_scheduled_tokens]
             target_positions = positions[:num_scheduled_tokens]
             target_hidden_states = hidden_states[:num_scheduled_tokens]
@@ -502,8 +501,7 @@ class EagleTorchairProposer(EagleProposer):
             # [batch_size]
             num_rejected_tokens: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        device = common_attn_metadata.query_start_loc.device
-        query_start_loc_cpu = common_attn_metadata.query_start_loc.cpu()
+        query_start_loc = common_attn_metadata.query_start_loc
         # cu_target_query_lens: [0, a, a + b, a + b + c]
         # num_rejected_tokens: [n1, n2, n3]
         # num_tokens_per_req: [a - n1, b - n2, c - n3]
@@ -512,15 +510,15 @@ class EagleTorchairProposer(EagleProposer):
         #                 a, a + 1, ..., a + b - n2 - 1,
         #                 a + b, a + b + 1, ..., a + b + c - n3 - 1]
         # [0, a, a + b, a + b + c] -> [a, b, c]
-        query_len_per_req = (query_start_loc_cpu[1:] -
-                             query_start_loc_cpu[:-1])
+        query_len_per_req = (query_start_loc[1:] -
+                             query_start_loc[:-1])
         # [a, b, c] -> [a - n1, b - n2, c - n3]
 
-        cu_num_tokens = query_start_loc_cpu
+        cu_num_tokens = query_start_loc
         relative_index = query_len_per_req - num_rejected_tokens - 1
         token_indices = cu_num_tokens[:-1] + relative_index
 
-        return cu_num_tokens.to(device, non_blocking=True), token_indices
+        return cu_num_tokens, token_indices
 
 
 

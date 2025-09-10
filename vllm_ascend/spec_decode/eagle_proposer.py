@@ -280,7 +280,8 @@ class EagleProposer(Proposer):
                 target_hidden_states = torch.cat(
                     [h[token_indices] for h in aux_hidden_states], dim=-1)
             else:
-                target_hidden_states = hidden_states[token_indices]
+                if isinstance(hidden_states, torch.Tensor):
+                    target_hidden_states = hidden_states[token_indices]
             target_slot_mapping = eagle_attn_metadata.slot_mapping[
                 token_indices]
 
